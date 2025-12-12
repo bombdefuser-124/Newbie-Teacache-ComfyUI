@@ -1,7 +1,8 @@
 # Newbie-Teacache-ComfyUI
 
-Major parts of this project were used as base and are still on the nodes:
+Major parts of these projects were used as base and are still on the nodes:
 https://github.com/spawner1145/CUI-Lumina2-TeaCache // Huge thanks to spawner1145 o/
+https://github.com/comfyanonymous/ComfyUI/pull/11284 // Most of the info about how to properly make TeaCache work with NewBie came from here o/
 
 Most of the code here was written with the help of multiple coding assistants (mainly Claude and Gemini).
 These nodes contain a patched loader for using TeaCache with NewBie and a Coefficient Calculator that I used to get an _okayish_ coefficient.
