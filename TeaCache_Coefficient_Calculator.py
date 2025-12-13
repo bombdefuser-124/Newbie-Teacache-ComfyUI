@@ -1,27 +1,11 @@
-"""
-TeaCache Coefficient Calculator for Lumina2/Newbie Models (Improved v3)
-
-Features:
-- Multi-generation support
-- Matches Newbie architecture input logic strictly
-- Auto-clamps polynomial output to be positive (safety)
-"""
-
 import torch
 import numpy as np
-from typing import Dict, Any, Tuple, List, Optional
 import comfy.model_management
 import comfy.samplers
 import comfy.sample
 import comfy.utils
-from unittest.mock import patch
-
 
 class TeaCacheCoefficientCalculator:
-    """
-    Calculates TeaCache polynomial coefficients for Newbie models.
-    """
-    
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -36,7 +20,7 @@ class TeaCacheCoefficientCalculator:
                 "sampler_name": (comfy.samplers.SAMPLER_NAMES,),
                 "scheduler": (comfy.samplers.SCHEDULER_NAMES,),
                 "num_generations": ("INT", {"default": 5, "min": 1, "max": 50}),
-                "polynomial_order": ("INT", {"default": 4, "min": 1, "max": 5}),
+                "polynomial_order": ("INT", {"default": 1, "min": 1, "max": 5}), # Default to Linear
                 "denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
             },
         }
@@ -61,163 +45,158 @@ class TeaCacheCoefficientCalculator:
         num_generations: int,
         polynomial_order: int,
         denoise: float,
-    ) -> Tuple[str, str]:
+    ) -> tuple[str, str]:
         
         all_input_diffs = []
         all_output_diffs = []
         
         diffusion_model = model.get_model_object("diffusion_model")
         
-        print(f"TeaCache Coefficient Calculator: Running {num_generations} generations...")
+        # --- Hook Setup ---
+        captured_mod_inputs = []
         
-        for gen_idx in range(num_generations):
-            current_seed = seed + gen_idx
-            modulated_inputs = []
-            denoised_outputs = []
+        def modulation_hook(module, input, output):
+            # Output of adaLN_modulation is (shift, scale, gate) usually, or just processed emb
+            # TeaCache_Newbie checks: mod_result = layers[0].adaLN_modulation(adaln_input)
+            # So we capture 'output' here.
+            # If it returns tuple, take first element.
+            content = output[0] if isinstance(output, tuple) else output
+            captured_mod_inputs.append(content.detach().cpu().float().clone())
             
-            # Match TeaCache_Newbie logic exactly for input capture
-            original_forward = diffusion_model.forward
-            
-            def capturing_forward(x, t, cap_feats, cap_mask, **kwargs):
-                try:
-                    # Newbie just uses t_emb as adaln_input, no CLIP addition here
-                    t_emb = diffusion_model.t_embedder(t)
-                    adaln_input = t_emb
-                    
-                    if diffusion_model.layers and hasattr(diffusion_model.layers[0], 'adaLN_modulation'):
-                        mod_result = diffusion_model.layers[0].adaLN_modulation(adaln_input)
-                        modulated_inputs.append(mod_result.detach().cpu().float().clone())
-                except Exception as e:
-                    pass
+        handle = None
+        # Try to attach hook
+        try:
+            if hasattr(diffusion_model, 'layers') and len(diffusion_model.layers) > 0:
+                first_layer = diffusion_model.layers[0]
+                if hasattr(first_layer, 'adaLN_modulation'):
+                    handle = first_layer.adaLN_modulation.register_forward_hook(modulation_hook)
+                else:
+                    return ("Error", "Error: Model layers[0] has no 'adaLN_modulation'. Architecture mismatch.")
+            else:
+                return ("Error", "Error: Model has no 'layers'.")
+        except Exception as e:
+            return ("Error", f"Error attaching hook: {e}")
+
+        print(f"TeaCache Calculator: Hook attached. Running {num_generations} generations...")
+        
+        try:
+            for gen_idx in range(num_generations):
+                current_seed = seed + gen_idx
+                captured_mod_inputs.clear() # Clear for this run
+                denoised_outputs = []
                 
-                return original_forward(x, t, cap_feats, cap_mask, **kwargs)
-            
-            def collection_callback(step, x, x0, total_steps):
-                try:
+                # Callback for outputs
+                def callback(step, x, x0, total_steps):
                     denoised_outputs.append(x0.detach().cpu().float().clone())
-                except:
-                    pass
-            
-            print(f"  Generation {gen_idx + 1}/{num_generations} (seed={current_seed})...")
-            
-            latent = latent_image.copy()
-            samples = latent["samples"]
-            noise = comfy.sample.prepare_noise(samples, current_seed, None)
-            noise_mask = latent.get("noise_mask", None)
-            
-            sampler = comfy.samplers.KSampler(
-                model, 
-                steps=steps,
-                device=comfy.model_management.get_torch_device(),
-                sampler=sampler_name,
-                scheduler=scheduler,
-                denoise=denoise,
-            )
-            
-            with patch.object(diffusion_model, 'forward', capturing_forward):
-                _ = sampler.sample(
-                    noise,
-                    positive,
-                    negative,
-                    cfg=cfg,
-                    latent_image=samples,
-                    start_step=0,
-                    last_step=steps,
-                    force_full_denoise=True,
-                    denoise_mask=noise_mask,
-                    seed=current_seed,
-                    callback=collection_callback,
+                
+                print(f"  Gen {gen_idx+1}/{num_generations}...")
+                
+                # Run Sampling
+                latent = latent_image.copy()
+                samples = latent["samples"]
+                noise = comfy.sample.prepare_noise(samples, current_seed, None)
+                
+                sampler = comfy.samplers.KSampler(
+                    model, steps=steps, device=comfy.model_management.get_torch_device(),
+                    sampler=sampler_name, scheduler=scheduler, denoise=denoise
                 )
-            
-            # Process groups (cond vs uncond)
-            mod_by_batch = {}
-            for mod in modulated_inputs:
-                batch_key = mod.shape[0]
-                if batch_key not in mod_by_batch:
-                    mod_by_batch[batch_key] = []
-                mod_by_batch[batch_key].append(mod)
-            
-            out_by_batch = {}
-            for out in denoised_outputs:
-                batch_key = out.shape[0]
-                if batch_key not in out_by_batch:
-                    out_by_batch[batch_key] = []
-                out_by_batch[batch_key].append(out)
-            
-            # Calculate differences
-            gen_data_points = 0
-            for batch_key in mod_by_batch:
-                mods = mod_by_batch[batch_key]
-                outs = out_by_batch.get(batch_key, [])
                 
-                min_len = min(len(mods), len(outs)) if outs else len(mods)
-                if min_len < 2:
-                    continue
+                sampler.sample(
+                    noise, positive, negative, cfg=cfg, 
+                    latent_image=samples, start_step=0, last_step=steps,
+                    force_full_denoise=True, seed=current_seed, callback=callback
+                )
                 
-                for i in range(1, min_len):
-                    prev_mod = mods[i-1]
-                    curr_mod = mods[i]
-                    prev_mean = prev_mod.abs().mean()
-                    if prev_mean.item() > 1e-9:
-                        input_diff = ((curr_mod - prev_mod).abs().mean() / prev_mean).item()
-                    else:
-                        continue
+                # Post-process data for this generation
+                # 1. Group captured inputs by batch size (handles CFG cond/uncond)
+                mod_by_batch = {}
+                for mod in captured_mod_inputs:
+                    b_size = mod.shape[0]
+                    if b_size not in mod_by_batch: mod_by_batch[b_size] = []
+                    mod_by_batch[b_size].append(mod)
                     
-                    if i < len(outs):
-                        prev_out = outs[i-1]
-                        curr_out = outs[i]
-                        prev_out_mean = prev_out.abs().mean()
-                        if prev_out_mean.item() > 1e-9:
-                            output_diff = ((curr_out - prev_out).abs().mean() / prev_out_mean).item()
-                        else:
-                            continue
-                    else:
-                        continue
+                # 2. Group outputs
+                out_by_batch = {}
+                for out in denoised_outputs:
+                    b_size = out.shape[0]
+                    if b_size not in out_by_batch: out_by_batch[b_size] = []
+                    out_by_batch[b_size].append(out)
+                
+                # 3. Calculate Diffs
+                points_added = 0
+                for b_size in mod_by_batch:
+                    mods = mod_by_batch[b_size]
+                    outs = out_by_batch.get(b_size, [])
                     
-                    if (np.isfinite(input_diff) and np.isfinite(output_diff) and 
-                        input_diff > 0 and output_diff > 0):
-                        all_input_diffs.append(input_diff)
-                        all_output_diffs.append(output_diff)
-                        gen_data_points += 1
+                    
+                    limit = min(len(mods), len(outs))
+                    if limit < 2: continue
+                    
+                    for i in range(1, limit):
+                        # Input Diff
+                        prev_m, curr_m = mods[i-1], mods[i]
+                        p_mean = prev_m.abs().mean()
+                        if p_mean < 1e-9: continue
+                        inp_diff = ((curr_m - prev_m).abs().mean() / p_mean).item()
+                        
+                        # Output Diff
+                        prev_o, curr_o = outs[i-1], outs[i]
+                        p_omean = prev_o.abs().mean()
+                        if p_omean < 1e-9: continue
+                        out_diff = ((curr_o - prev_o).abs().mean() / p_omean).item()
+                        
+                        if inp_diff > 0 and out_diff > 0:
+                            all_input_diffs.append(inp_diff)
+                            all_output_diffs.append(out_diff)
+                            points_added += 1
+                            
+                print(f"    captured {len(captured_mod_inputs)} inputs, used {points_added} points")
+                
+        finally:
+            if handle: handle.remove()
             
-            print(f"    Data points: {gen_data_points}")
+        print(f"Total points: {len(all_input_diffs)}")
         
-        if len(all_input_diffs) < polynomial_order + 1:
-            return (f"ERROR: Only {len(all_input_diffs)} points", "Error")
-        
-        # Fit polynomial
+        if len(all_input_diffs) < 2:
+            return ("Error", "Not enough data points collected.")
+            
+        # Fit Polynomial
         x = np.array(all_input_diffs)
         y = np.array(all_output_diffs)
         
-        coefficients = np.polyfit(x, y, polynomial_order)
-        coeff_str = ", ".join([f"{c:.8f}" for c in coefficients])
+        coeffs = np.polyfit(x, y, polynomial_order)
         
-        # Verify fit
-        poly = np.poly1d(coefficients)
+        # Format for output (pad with 0s to make 5 coeffs if order < 4)
+        # TeaCache expects: c0*x^4 + ... + c4
+        # polyfit returns [highest_order, ..., constant]
+        # output needs to be 5 numbers.
+        
+        final_coeffs_list = [0.0] * 5
+        # Fill from end
+        # deg=1 -> [c1, c0] -> final [0, 0, 0, c1, c0]
+        for i, c in enumerate(coeffs[::-1]): # Reverse to start from constant
+             final_coeffs_list[4-i] = float(c)
+             
+        coeff_str = ", ".join([f"{c:.8f}" for c in final_coeffs_list])
+        
+        # Report
+        poly = np.poly1d(coeffs)
         y_pred = poly(x)
         r2 = 1 - (np.sum((y - y_pred)**2) / np.sum((y - np.mean(y))**2))
         
-        # Check if coefficients produce negative values in range
-        x_range = np.linspace(x.min(), x.max(), 100)
-        y_range_pred = poly(x_range)
-        min_pred = y_range_pred.min()
-        warn_msg = ""
-        if min_pred < 0:
-            warn_msg = "\nWARNING: Polynomial produces negative values! Coefficients may be unstable."
-        
-        report = f"""TeaCache Coefficient Report
-===========================
-Generations: {num_generations}
-Data points: {len(all_input_diffs)}
-Range Input: {x.min():.4f} - {x.max():.4f}
-Range Output: {y.min():.4f} - {y.max():.4f}
-
+        report = f"""TeaCache Analysis (Hook-Based)
+============================
+Gens: {num_generations} | Steps: {steps}
+Points: {len(all_input_diffs)}
+Order: {polynomial_order}
 Fit R²: {r2:.4f}
-{warn_msg}
+
+Input Range: {x.min():.4f} - {x.max():.4f}
+Output Range: {y.min():.4f} - {y.max():.4f}
 
 Coefficients:
 [{coeff_str}]
-""" 
+"""
         return (coeff_str, report)
 
 NODE_CLASS_MAPPINGS = { "TeaCacheCoefficientCalculator": TeaCacheCoefficientCalculator }

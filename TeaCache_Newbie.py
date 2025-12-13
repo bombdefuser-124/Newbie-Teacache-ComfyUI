@@ -1,11 +1,7 @@
 """
 TeaCache for Newbie/Lumina2 Models
 
-This is a modified version of TeaCache adapted for the Newbie model architecture.
-The main differences from standard Lumina2 TeaCache:
-1. TimestepEmbedder.forward() doesn't accept dtype argument
-2. Different forward signature (no num_tokens parameter)
-3. patchify_and_embed uses adaln_input instead of num_tokens
+Adapted for the updated Newbie code
 """
 
 import torch
@@ -16,19 +12,33 @@ import re
 
 DEFAULT_COEFFICIENTS = [0, 0, 0, 4.11423217, 0.36885889]
 
+def _get_clip_from_kwargs(transformer_options: dict, kwargs: dict, key: str):
+    if key in kwargs:
+        return kwargs.get(key)
+    if transformer_options is not None and key in transformer_options:
+        return transformer_options.get(key)
+    extra = transformer_options.get("extra_cond", None) if transformer_options else None
+    if isinstance(extra, dict) and key in extra:
+        return extra.get(key)
+    return None
 
 def teacache_forward_newbie(
-    self, x, t, cap_feats, cap_mask, **kwargs
+    self, 
+    x: torch.Tensor, 
+    timesteps: torch.Tensor, 
+    context: torch.Tensor, 
+    num_tokens: int = None,
+    attention_mask=None, 
+    transformer_options: dict = {}, 
+    **kwargs
 ):
     """
-    TeaCache-enabled forward pass for Newbie models.
-    
-    Signature matches the original NextDiT_CLIP.forward exactly:
-    forward(self, x, t, cap_feats, cap_mask, **kwargs)
+    TeaCache-enabled forward pass matching new NewbieNextDiT._forward signature.
     """
-    # Get TeaCache options from self (stored by wrapper) since transformer_options isn't propagated
-    teacache_opts = getattr(self, '_teacache_current_options', {})
+    # Get TeaCache options: Prefer passed options, fall back to stored
+    teacache_opts = transformer_options if transformer_options and 'enable_teacache' in transformer_options else getattr(self, '_teacache_current_options', {})
     
+    # Initialize state if needed
     if not hasattr(self, 'teacache_state'):
         self.teacache_state = {
             "cnt": 0,
@@ -44,86 +54,100 @@ def teacache_forward_newbie(
 
     enable_teacache = teacache_opts.get('enable_teacache', False)
     
-    # Store original dimensions for cropping
-    bs, c_channels, h_img, w_img = x.shape
+    # Check start/end logic
+    start_step = teacache_opts.get("teacache_start_step", 0)
+    end_step = teacache_opts.get("teacache_end_step", 10000)
+    current_cnt = self.teacache_state['cnt']
+
+    if current_cnt < start_step or current_cnt >= end_step:
+        enable_teacache = False
     
-    # Handle CLIP embeddings
-    clip_text_pooled = kwargs.get('clip_text_pooled')
-    clip_img_pooled = kwargs.get('clip_img_pooled')
+    # === MODEL LOGIC START (Matches newbie/model.py) ===
+
+    t = timesteps
+    cap_feats = context
+    cap_mask = attention_mask
+    bs, c, h, w = x.shape
     
-    # Pad to patch size (same as original)
     x = pad_to_patch_size(x, (self.patch_size, self.patch_size))
     
-    # === EXACT SAME FLOW AS NextDiT_CLIP.forward ===
-    # Note: t is already the timestep value, no conversion needed (ComfyUI handles this)
-    
-    # Step 1: Embed timestep
-    t_emb = self.t_embedder(t)
+    t_emb = self.t_embedder(t, dtype=x.dtype)
     adaln_input = t_emb
     
-    # cap_feats and cap_mask are already passed correctly from ComfyUI
+    clip_text_pooled = _get_clip_from_kwargs(transformer_options, kwargs, "clip_text_pooled")
+    clip_img_pooled = _get_clip_from_kwargs(transformer_options, kwargs, "clip_img_pooled")
     
-    # Embed cap_feats (this is what the original model does)
-    if hasattr(self, 'cap_embedder') and cap_feats is not None:
+    if clip_text_pooled is not None:
+        if clip_text_pooled.dim() > 2:
+            clip_text_pooled = clip_text_pooled.view(clip_text_pooled.shape[0], -1)
+        clip_text_pooled = clip_text_pooled.to(device=t_emb.device, dtype=t_emb.dtype)
+        
+        if hasattr(self, 'clip_text_pooled_proj'):
+            clip_emb = self.clip_text_pooled_proj(clip_text_pooled)
+            if hasattr(self, 'time_text_embed'):
+                adaln_input = self.time_text_embed(torch.cat([t_emb, clip_emb], dim=-1))
 
+    if clip_img_pooled is not None:
+        if clip_img_pooled.dim() > 2:
+            clip_img_pooled = clip_img_pooled.view(clip_img_pooled.shape[0], -1)
+        clip_img_pooled = clip_img_pooled.to(device=t_emb.device, dtype=t_emb.dtype)
+        if hasattr(self, 'clip_img_pooled_embedder'):
+            adaln_input = adaln_input + self.clip_img_pooled_embedder(clip_img_pooled)
+            
+    if isinstance(cap_feats, torch.Tensor):
+        try:
+            target_dtype = next(self.cap_embedder.parameters()).dtype
+        except StopIteration:
+            target_dtype = cap_feats.dtype
+        cap_feats = cap_feats.to(device=t_emb.device, dtype=target_dtype)
+        
+    if hasattr(self, 'cap_embedder'):
         cap_feats = self.cap_embedder(cap_feats)
-    
-    # Handle CLIP text pooled
-    if hasattr(self, 'clip_text_pooled_proj') and clip_text_pooled is not None:
-        clip_emb = self.clip_text_pooled_proj(clip_text_pooled)
-        combined_features = torch.cat([t_emb, clip_emb], dim=-1)
-        if hasattr(self, 'time_text_embed'):
-            adaln_input = self.time_text_embed(combined_features)
-    
-    # Handle CLIP image pooled
-    if hasattr(self, 'clip_img_pooled_embedder') and clip_img_pooled is not None:
-        clip_img_pooled_emb = self.clip_img_pooled_embedder(clip_img_pooled)
-        adaln_input = adaln_input + clip_img_pooled_emb
-    
-    # Step 3: Patchify and embed
-    x_is_tensor = isinstance(x, torch.Tensor)
-    x, mask, img_size, cap_size, freqs_cis = self.patchify_and_embed(x, cap_feats, cap_mask, adaln_input)
-    freqs_cis = freqs_cis.to(x.device)
-    
-    # === TEACACHE LOGIC ===
-    max_seq_len = x.shape[1]
+        
+    # TeaCache Logic Setup
     should_calc = True
-    # enable_teacache already set from teacache_opts above
     current_cache = None
     modulated_inp = None
-    
+
     if enable_teacache:
-        cache_key = max_seq_len
-        if cache_key not in self.teacache_state['cache']:
-            self.teacache_state['cache'][cache_key] = {
-                "accumulated_rel_l1_distance": 0.0,
-                "previous_modulated_input": None,
-                "previous_residual": None,
-            }
-        current_cache = self.teacache_state['cache'][cache_key]
-        
         try:
-            if self.layers and hasattr(self.layers[0], 'adaLN_modulation'):
+             if self.layers and hasattr(self.layers[0], 'adaLN_modulation'):
                 mod_result = self.layers[0].adaLN_modulation(adaln_input.clone())
                 if isinstance(mod_result, (list, tuple)) and len(mod_result) > 0:
                     modulated_inp = mod_result[0]
                 elif torch.is_tensor(mod_result):
                     modulated_inp = mod_result
-                else:
-                    raise ValueError("adaLN_modulation returned unexpected type")
-            else:
-                raise AttributeError("Layer 0 or adaLN_modulation not found")
-        except Exception as e:
-            print(f"Warning: TeaCache - Failed to get modulated_inp: {e}. Disabling cache for this step.")
+        except Exception:
             enable_teacache = False
-            should_calc = True
-            modulated_inp = None
-            if current_cache:
-                current_cache["previous_modulated_input"] = None
-                current_cache["accumulated_rel_l1_distance"] = 0.0
 
-    if enable_teacache and modulated_inp is not None and current_cache is not None:
+        if enable_teacache and modulated_inp is not None:
+             # Create Independent Caches for different shapes (Cond vs Uncond)
+             # Use modulated_inp.shape AND num_tokens as key to differentiate.
+             # adaln_input shape alone is not unique enough (batch size same).
+             cache_key_shape = f"{modulated_inp.shape}_{num_tokens}"
+            
+             if "cache" not in transformer_options:
+                 transformer_options["cache"] = {}
+            
+             # Root cache
+             root_cache = transformer_options["cache"]
+            
+             # Sub cache for this specific shape
+             if cache_key_shape not in root_cache:
+                 root_cache[cache_key_shape] = {
+                     "previous_modulated_input": None,
+                     "accumulated_rel_l1_distance": 0.0,
+                     "previous_residual": None
+                 }
+             current_cache = root_cache[cache_key_shape]
+
+    
+    # TeaCache Decision Logic
+    # No need to check 'modulated_inp is not None' as it is adaln_input which is required.
+    if enable_teacache and current_cache is not None:
         num_steps_in_state = self.teacache_state.get("num_steps")
+        
+        # Heuristic: if first step or last step, always calc
         if num_steps_in_state is None or num_steps_in_state == 0:
             should_calc = True
             current_cache["accumulated_rel_l1_distance"] = 0.0
@@ -133,13 +157,9 @@ def teacache_forward_newbie(
         else:
             if current_cache.get("previous_modulated_input") is not None:
                 coefficients = teacache_opts.get('coefficients', DEFAULT_COEFFICIENTS)
-                if not isinstance(coefficients, (list, tuple)):
-                    coefficients = DEFAULT_COEFFICIENTS
-                
                 try:
                     rescale_func = np.poly1d(coefficients)
-                except Exception as e:
-                    print(f"Warning: TeaCache np.poly1d failed: {e}. Using default.")
+                except:
                     rescale_func = np.poly1d(DEFAULT_COEFFICIENTS)
 
                 prev_mod_input = current_cache["previous_modulated_input"]
@@ -151,66 +171,94 @@ def teacache_forward_newbie(
                     if prev_mean.item() > 1e-9:
                         rel_l1_change = ((modulated_inp - prev_mod_input).abs().mean() / prev_mean).cpu().item()
                     else:
-                        rel_l1_change = 0.0 if modulated_inp.abs().mean().item() < 1e-9 else float('inf')
+                        rel_l1_change = 0.0
                     
                     rescaled_value = rescale_func(rel_l1_change)
                     if np.isnan(rescaled_value) or np.isinf(rescaled_value):
-                        current_cache["accumulated_rel_l1_distance"] = float('inf')
+                         current_cache["accumulated_rel_l1_distance"] = float('inf')
                     else:
-                        current_cache["accumulated_rel_l1_distance"] += rescaled_value
+                         current_cache["accumulated_rel_l1_distance"] += rescaled_value
 
-                    if current_cache["accumulated_rel_l1_distance"] < teacache_opts.get('rel_l1_thresh', 0.3):
-
+                    thresh = teacache_opts.get('rel_l1_thresh', 0.3)
+                    if current_cache["accumulated_rel_l1_distance"] < thresh:
                         should_calc = False
+                        # print(f"CACHE HIT! Diff: {rel_l1_change:.4f}, Rescaled: {rescaled_value:.4f}, Accum: {current_cache['accumulated_rel_l1_distance']:.4f} < {thresh}")
                     else:
                         should_calc = True
+                        # print(f"CALC: Accum {current_cache['accumulated_rel_l1_distance']:.4f} >= {thresh}")
                         current_cache["accumulated_rel_l1_distance"] = 0.0
             else:
-                should_calc = True
-                current_cache["accumulated_rel_l1_distance"] = 0.0
-
+                 should_calc = True
+                 current_cache["accumulated_rel_l1_distance"] = 0.0
+    else:
+        if not enable_teacache: 
+            # print("TeaCache DISABLED") # Commented out to reduce spam
+            pass
+        elif modulated_inp is None: 
+            # print("Modulated Input NONE") # Commented out
+            pass
+    
+    if current_cache is not None and modulated_inp is not None:
         current_cache["previous_modulated_input"] = modulated_inp.clone()
 
-        if self.teacache_state.get('uncond_seq_len') is None:
-            self.teacache_state['uncond_seq_len'] = cache_key
-
-        if num_steps_in_state is not None and cache_key != self.teacache_state.get('uncond_seq_len'):
+        
+        # Update Step Count based on Timestep change
+        current_t_val = t[0].item() if t.numel() > 0 else 0
+        last_t_val = self.teacache_state.get('last_timestep')
+        
+        if last_t_val is not None and abs(current_t_val - last_t_val) > 1e-4:
             self.teacache_state['cnt'] += 1
             if self.teacache_state['cnt'] >= num_steps_in_state:
-                self.teacache_state['cnt'] = 0
+                 self.teacache_state['cnt'] = num_steps_in_state - 1 # Clamp
 
-    # === PROCESS THROUGH LAYERS ===
+        self.teacache_state['last_timestep'] = current_t_val
+
+
+    patches = transformer_options.get("patches", {})
+    x_is_tensor = True
+    
+    img, mask, img_size, cap_size, freqs_cis = self.patchify_and_embed(
+        x, cap_feats, cap_mask, adaln_input, num_tokens, transformer_options=transformer_options
+    )
+    freqs_cis = freqs_cis.to(img.device)
+    
     can_reuse_residual = (enable_teacache and 
                          not should_calc and 
                          current_cache and 
                          current_cache.get("previous_residual") is not None and
-                         current_cache["previous_residual"].shape == x.shape)
-
-    if can_reuse_residual:
-        processed_x = x + current_cache["previous_residual"]
-
-
-    else:
-        original_x = x.clone()
-        current_x = x
-        for layer in self.layers:
-            current_x = layer(current_x, mask, freqs_cis, adaln_input)
-
-        if enable_teacache and current_cache:
-            current_cache["previous_residual"] = current_x - original_x
-            current_cache["accumulated_rel_l1_distance"] = 0.0
-        processed_x = current_x
-
-    # Step 4: Final layer and unpatchify (same as original)
-    output = self.final_layer(processed_x, adaln_input)
-    output = self.unpatchify(output, img_size, cap_size, return_tensor=x_is_tensor)
+                         current_cache["previous_residual"].shape == img.shape)
     
-    # Crop to original size (original model doesn't crop, but we padded earlier)
-    if isinstance(output, torch.Tensor):
-        output = output[:, :, :h_img, :w_img]
+    if can_reuse_residual:
+        img = img + current_cache["previous_residual"]
+    else:
+        original_img = img.clone()
 
+        for i, layer in enumerate(self.layers):
+            img = layer(img, mask, freqs_cis, adaln_input, transformer_options=transformer_options)
+            if "double_block" in patches:
+                for p in patches["double_block"]:
+                     out = p({
+                        "img": img[:, cap_size[0] :],
+                        "txt": img[:, : cap_size[0]],
+                        "pe": freqs_cis[:, cap_size[0] :],
+                        "vec": adaln_input,
+                        "x": x,
+                        "block_index": i,
+                        "transformer_options": transformer_options,
+                     })
+                     if isinstance(out, dict):
+                        if "img" in out: img[:, cap_size[0] :] = out["img"]
+                        if "txt" in out: img[:, : cap_size[0]] = out["txt"]
+        
+        if enable_teacache and current_cache:
+            current_cache["previous_residual"] = img - original_img
+            # current_cache["accumulated_rel_l1_distance"] = 0.0 # This was WRONG. We reset only when we DECIDE to calc, which we did earlier.
 
-    return output
+            
+    img = self.final_layer(img, adaln_input)
+    img = self.unpatchify(img, img_size, cap_size, return_tensor=x_is_tensor)
+    img = img[:, :, :h, :w]
+    return img
 
 
 class TeaCache_Newbie:
@@ -224,14 +272,11 @@ class TeaCache_Newbie:
             "required": {
                 "model": ("MODEL",),
                 "rel_l1_thresh": ("FLOAT", {"default": 0.6, "min": 0.0, "step": 0.001}),
-                "start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01,
-                                            "tooltip": "The start percentage of the steps that will apply TeaCache."}),
-                "end_percent": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01,
-                                          "tooltip": "The end percentage of the steps that will apply TeaCache."}),
+                "start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "end_percent": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "coefficients_string": ("STRING", {
                     "multiline": True, 
-                    "default": str(DEFAULT_COEFFICIENTS),
-                    "tooltip": "Coefficients for np.poly1d. Format: 393.7, -603.5, 209.1, -23.0, 0.86"
+                    "default": str(DEFAULT_COEFFICIENTS)
                 }),
             }
         }
@@ -258,7 +303,7 @@ class TeaCache_Newbie:
                 if coeff_list:
                     parsed_coefficients = coeff_list
         except Exception as e:
-            print(f"Warning: TeaCache - Error parsing coefficients: {e}. Using defaults.")
+            print(f"Warning: TeaCache - using default coeffs: {e}")
 
         new_model = model.clone()
         if 'transformer_options' not in new_model.model_options:
@@ -270,106 +315,75 @@ class TeaCache_Newbie:
         new_model.model_options["transformer_options"]["coefficients"] = parsed_coefficients
         
         diffusion_model = new_model.get_model_object("diffusion_model")
-
+        
+        # Cleanup old state
         if hasattr(diffusion_model, 'teacache_state'):
             delattr(diffusion_model, 'teacache_state')
+        if hasattr(diffusion_model, '_teacache_generation_id'):
+            delattr(diffusion_model, '_teacache_generation_id')
 
+        # Patch forward (_forward is the method implemented in NewbieNextDiT)
         context_patch_manager = patch.multiple(
             diffusion_model,
-            forward=teacache_forward_newbie.__get__(diffusion_model, diffusion_model.__class__)
-        )
+            _forward=teacache_forward_newbie.__get__(diffusion_model, diffusion_model.__class__)
+        ).start()
 
         def unet_wrapper_function(model_function, kwargs):
             input_val = kwargs["input"]
             timestep = kwargs["timestep"]
             c_condition_dict = kwargs["c"]
-
-            if not isinstance(c_condition_dict, dict): 
-                c_condition_dict = {}
-            if "transformer_options" not in c_condition_dict or not isinstance(c_condition_dict["transformer_options"], dict):
+            # Ensure transformer_options exists
+            if "transformer_options" not in c_condition_dict:
                 c_condition_dict["transformer_options"] = {}
 
-            for key, value in new_model.model_options["transformer_options"].items():
-                if key not in c_condition_dict["transformer_options"]:
-                    c_condition_dict["transformer_options"][key] = value
-
-            current_step_index = 0
-            if "sample_sigmas" not in c_condition_dict["transformer_options"] or \
-               c_condition_dict["transformer_options"]["sample_sigmas"] is None:
-                print("warning: TeaCache - 'sample_sigmas' not found. TeaCache might not work correctly.")
-                c_condition_dict["transformer_options"]["enable_teacache"] = False
-                c_condition_dict["transformer_options"]["num_steps"] = 1
-                if hasattr(diffusion_model, 'teacache_state'):
-                    delattr(diffusion_model, 'teacache_state')
+            # Propagate options
+            opts = new_model.model_options["transformer_options"]
+            c_condition_dict["transformer_options"].update({
+                "rel_l1_thresh": opts["rel_l1_thresh"],
+                "enable_teacache": True,
+                "coefficients": opts["coefficients"],
+                "cache": opts["cache"],
+                "uncond_seq_len": opts["uncond_seq_len"]
+            })
+            
+            # Attach options to the diffusion_model instance so 'self' can access them
+            # model_function is usually apply_model, so __self__ is the Model object (e.g. BaseModel)
+            # The actual UNet is in .diffusion_model
+            model_obj = model_function.__self__ if hasattr(model_function, '__self__') else model_function
+            if hasattr(model_obj, "diffusion_model"):
+                target_model = model_obj.diffusion_model
             else:
-                sigmas = c_condition_dict["transformer_options"]["sample_sigmas"]
-                total_sampler_steps = len(sigmas)
-                if total_sampler_steps > 0:
-                    c_condition_dict["transformer_options"]["num_steps"] = total_sampler_steps
-                else:
-                    c_condition_dict["transformer_options"]["num_steps"] = 1
-                    c_condition_dict["transformer_options"]["enable_teacache"] = False
+                target_model = model_obj # Fallback
+            
+            # DEBUG PRINT
+            # print(f"TeaCache Wrapper: Set Enable=True. ID: {id(target_model)}")
 
-                if hasattr(diffusion_model, 'teacache_state') and diffusion_model.teacache_state is not None:
-                    if diffusion_model.teacache_state.get("num_steps") != total_sampler_steps and total_sampler_steps > 0:
-                        delattr(diffusion_model, 'teacache_state')
-                        c_condition_dict["transformer_options"]["cache"] = {}
-
-                current_timestep = timestep[0].to(device=sigmas.device, dtype=sigmas.dtype)
-                close_mask = torch.isclose(sigmas, current_timestep, atol=1e-6)
-                if close_mask.any():
-                    matched_step_index = torch.nonzero(close_mask, as_tuple=True)[0]
-                    current_step_index = matched_step_index[0].item()
-                else:
-                    current_step_index = 0 
-                    if total_sampler_steps > 1:
-                        try:
-                            indices = torch.where(sigmas >= current_timestep)[0]
-                            if len(indices) > 0:
-                                current_step_index = indices[-1].item()
-                            else:
-                                current_step_index = total_sampler_steps - 1
-                        except:
-                            pass
-
-                current_percent = 0.0
-                if total_sampler_steps > 1:
-                    current_percent = current_step_index / max(1, (total_sampler_steps - 1))
-                elif total_sampler_steps <= 0:
-                    c_condition_dict["transformer_options"]["enable_teacache"] = False
-
-                if start_percent <= current_percent <= end_percent and total_sampler_steps > 0:
-                    c_condition_dict["transformer_options"]["enable_teacache"] = True
-                else:
-                    c_condition_dict["transformer_options"]["enable_teacache"] = False
-
-            if current_step_index == 0:
-                # Only reset ONCE at start of generation, not on every CFG call
-                # Track using a generation marker based on sigmas tensor id
-                current_gen_id = id(sigmas)
-                last_gen_id = getattr(diffusion_model, '_teacache_generation_id', None)
-                if last_gen_id != current_gen_id:
-                    if hasattr(diffusion_model, 'teacache_state'):
-                        delattr(diffusion_model, 'teacache_state')
-                    c_condition_dict["transformer_options"]["cache"] = {}
-                    diffusion_model._teacache_generation_id = current_gen_id
-
-            # Store current options on diffusion_model so forward can access them
-            diffusion_model._teacache_current_options = dict(c_condition_dict["transformer_options"])
-
-            with context_patch_manager:
-                return model_function(input_val, timestep, **c_condition_dict)
+            sigmas = c_condition_dict["transformer_options"].get("sample_sigmas")
+            if sigmas is not None:
+                total_steps = len(sigmas) - 1
+                c_condition_dict["transformer_options"]["num_steps"] = total_steps
+                
+                # Convert percent to step indices
+                start_step = int(total_steps * start_percent)
+                end_step = int(total_steps * end_percent)
+                c_condition_dict["transformer_options"]["teacache_start_step"] = start_step
+                c_condition_dict["transformer_options"]["teacache_end_step"] = end_step
+            
+            current_gen_id = id(sigmas) if sigmas is not None else 0
+            last_gen_id = getattr(target_model, '_teacache_generation_id', None)
+            
+            if last_gen_id != current_gen_id:
+                if hasattr(target_model, 'teacache_state'):
+                    delattr(target_model, 'teacache_state')
+                c_condition_dict["transformer_options"]["cache"] = {} 
+                target_model._teacache_generation_id = current_gen_id
+            
+            target_model._teacache_current_options = c_condition_dict["transformer_options"]
+            
+            return model_function(input_val, timestep, **c_condition_dict)
 
         new_model.set_model_unet_function_wrapper(unet_wrapper_function)
         return (new_model,)
 
-
-
-# Node registration
-NODE_CLASS_MAPPINGS = {
-    "TeaCache_Newbie": TeaCache_Newbie,
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "TeaCache_Newbie": "TeaCache (Newbie)",
-}
+NODE_CLASS_MAPPINGS = { "TeaCache_Newbie": TeaCache_Newbie }
+NODE_DISPLAY_NAME_MAPPINGS = { "TeaCache_Newbie": "TeaCache (Newbie)" }
