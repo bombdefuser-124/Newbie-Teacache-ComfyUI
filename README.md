@@ -1,5 +1,7 @@
 # Newbie-Teacache-ComfyUI
 
+# Doesn't work with the updated NewBie code on Comfy. I'm working on a quick dirty fix and new coefficients.
+
 Major parts of these projects were used as base and are still on the nodes:
 
 https://github.com/spawner1145/CUI-Lumina2-TeaCache // Huge thanks to spawner1145 o/
