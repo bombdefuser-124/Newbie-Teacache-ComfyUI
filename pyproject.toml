@@ -28,7 +28,7 @@ Documentation = "https://github.com/bombdefuser-124/Newbie-Teacache-ComfyUI/wiki
 "Bug Tracker" = "https://github.com/bombdefuser-124/Newbie-Teacache-ComfyUI/issues"
 
 [tool.comfy]
-PublisherId = ""
+PublisherId = "bombdefuser-124"
 DisplayName = "Newbie-Teacache-ComfyUI"
 Icon = ""
 includes = [] 
