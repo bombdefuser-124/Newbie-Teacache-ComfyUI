@@ -1,6 +1,8 @@
 # Newbie-Teacache-ComfyUI
 
-# Working with woct0rdho lighter Newbie Implementation (https://github.com/woct0rdho/ComfyUI/tree/newbie) // Didn't test the calculator but it should be working
+# Working with woct0rdho lighter Newbie Implementation (https://github.com/woct0rdho/ComfyUI/tree/newbie) // Use the new node TeaCache (Lumina2)
+
+# Didn't test the calculator but it should be working
 
 Major parts of these projects were used as base and are still on the nodes:
 
